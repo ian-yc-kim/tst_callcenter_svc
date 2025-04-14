@@ -1,6 +1,5 @@
 import os
 import uuid
-import time
 import logging
 from datetime import datetime
 
@@ -8,6 +7,9 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, status, Depends
 
 # Import n8n integration components
 from tst_callcenter_svc.routers.n8n_integration import N8nTriggerRequest, trigger_n8n_workflow
+
+# Import preprocessing function
+from tst_callcenter_svc.audio_preprocessing import preprocess_audio
 
 # Import database dependencies and UploadMetadata model
 from tst_callcenter_svc.models.upload_metadata import UploadMetadata
@@ -20,22 +22,26 @@ ALLOWED_EXTENSIONS = ['.wav']
 ALLOWED_MIME_TYPES = ['audio/wav', 'audio/x-wav']
 
 
-def process_audio_file(file: UploadFile) -> dict:
+def process_audio_file(file_path: str) -> dict:
     """
-    Simulate audio processing (e.g., noise reduction).
-    In a production scenario, this function would invoke an actual noise reduction library.
-    Here we simply return a dummy processing result.
+    Process an audio file using the enhanced audio preprocessing module.
 
     Parameters:
-        file (UploadFile): The uploaded audio file.
+        file_path (str): The full path of the saved audio file.
 
     Returns:
-        dict: A dictionary containing processing status.
+        dict: A dictionary with keys 'status' and 'processed_file_path'.
+
+    Raises:
+        HTTPException: if preprocessing fails or returns an unexpected status.
     """
     try:
-        # Dummy processing simulation
-        time.sleep(0.1)
-        return {"status": "processed"}
+        result = preprocess_audio(file_path)
+        if result.get('status') != 'processed':
+            error_code = "AUDIO_PROC_ERR"
+            logging.error(f"Audio preprocessing failed with result: {result} (Error code: {error_code})")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Audio preprocessing failed with error code: {error_code}")
+        return result
     except Exception as e:
         logging.error(e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Audio processing failed")
@@ -44,21 +50,21 @@ def process_audio_file(file: UploadFile) -> dict:
 @router.post("/upload")
 async def upload_file(file: UploadFile = File(...), db = Depends(get_db)):
     """
-    Endpoint to handle secure file ingestion and audio preprocessing for recorded conversations.
+    Endpoint to handle secure file ingestion and enhanced audio preprocessing for recorded conversations.
 
     This endpoint validates the uploaded file (checking its extension, MIME type, and size),
-    securely stores the file to disk, logs metadata in the database, processes the audio file,
+    securely stores the file to disk, logs metadata in the database, processes the audio file via the enhanced preprocessing module,
     and triggers the n8n workflow integration.
 
     Parameters:
         file (UploadFile): The file to be uploaded. Must be a valid .wav file with MIME type 'audio/wav' or 'audio/x-wav'.
-        db (Session): The SQLAlchemy database session provided via dependency injection.
+        db: The database session provided via dependency injection.
 
     Returns:
-        dict: Response from the n8n workflow trigger if the upload and logging are successful.
+        dict: Response from the n8n workflow trigger if the upload and processing are successful.
 
     Raises:
-        HTTPException: For validation errors, disk write failures, or database insertion errors.
+        HTTPException: For validation errors, disk write failures, database insertion errors, or processing errors.
     """
     try:
         # Validate file existence
@@ -84,9 +90,6 @@ async def upload_file(file: UploadFile = File(...), db = Depends(get_db)):
 
         if file_size > MAX_FILE_SIZE:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File size exceeds the maximum limit of 100MB")
-
-        # Process the audio file (simulate noise reduction etc.)
-        processing_result = process_audio_file(file)
 
         # Generate unique filename and determine storage directory
         storage_dir = os.getenv("FILE_STORAGE_PATH", "secure_uploads")
@@ -124,12 +127,18 @@ async def upload_file(file: UploadFile = File(...), db = Depends(get_db)):
             logging.error(e, exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database insertion error")
 
-        # Construct payload for n8n workflow integration
+        # Process the audio file using enhanced preprocessing module
+        processing_result = process_audio_file(full_file_path)
+
+        # Construct payload for n8n workflow integration including additional metadata
         payload = N8nTriggerRequest(
             file_name=filename,
             file_size=file_size,
             upload_timestamp=upload_timestamp,
-            metadata={"processing_status": processing_result.get("status", "unknown")}
+            metadata={
+                "processing_status": processing_result.get("status", "unknown"),
+                "processed_file_path": processing_result.get("processed_file_path")
+            }
         )
 
         # Trigger n8n workflow integration
