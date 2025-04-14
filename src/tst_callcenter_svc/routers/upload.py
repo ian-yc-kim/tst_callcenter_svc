@@ -4,10 +4,14 @@ import time
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, HTTPException, UploadFile, File, status, Depends
 
 # Import n8n integration components
 from tst_callcenter_svc.routers.n8n_integration import N8nTriggerRequest, trigger_n8n_workflow
+
+# Import database dependencies and UploadMetadata model
+from tst_callcenter_svc.models.upload_metadata import UploadMetadata
+from tst_callcenter_svc.models.base import get_db
 
 router = APIRouter()
 
@@ -21,12 +25,15 @@ def process_audio_file(file: UploadFile) -> dict:
     Simulate audio processing (e.g., noise reduction).
     In a production scenario, this function would invoke an actual noise reduction library.
     Here we simply return a dummy processing result.
+
+    Parameters:
+        file (UploadFile): The uploaded audio file.
+
+    Returns:
+        dict: A dictionary containing processing status.
     """
     try:
         # Dummy processing simulation
-        # For example, you might read portions of the file and process them.
-        # file.file.seek(0)  # ensure at beginning if necessary
-        # Simulate processing delay
         time.sleep(0.1)
         return {"status": "processed"}
     except Exception as e:
@@ -35,12 +42,23 @@ def process_audio_file(file: UploadFile) -> dict:
 
 
 @router.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), db = Depends(get_db)):
     """
     Endpoint to handle secure file ingestion and audio preprocessing for recorded conversations.
 
-    Validates the uploaded file (extension, MIME type, and size) and processes the audio file.
-    Upon successful processing, triggers the n8n workflow integration with the processed file metadata.
+    This endpoint validates the uploaded file (checking its extension, MIME type, and size),
+    securely stores the file to disk, logs metadata in the database, processes the audio file,
+    and triggers the n8n workflow integration.
+
+    Parameters:
+        file (UploadFile): The file to be uploaded. Must be a valid .wav file with MIME type 'audio/wav' or 'audio/x-wav'.
+        db (Session): The SQLAlchemy database session provided via dependency injection.
+
+    Returns:
+        dict: Response from the n8n workflow trigger if the upload and logging are successful.
+
+    Raises:
+        HTTPException: For validation errors, disk write failures, or database insertion errors.
     """
     try:
         # Validate file existence
@@ -70,8 +88,43 @@ async def upload_file(file: UploadFile = File(...)):
         # Process the audio file (simulate noise reduction etc.)
         processing_result = process_audio_file(file)
 
-        # Construct payload for n8n workflow integration
+        # Generate unique filename and determine storage directory
+        storage_dir = os.getenv("FILE_STORAGE_PATH", "secure_uploads")
+        try:
+            os.makedirs(storage_dir, exist_ok=True)
+        except Exception as e:
+            logging.error(e, exc_info=True)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create storage directory")
+
+        unique_filename = f"{uuid.uuid4()}.wav"
+        full_file_path = os.path.join(storage_dir, unique_filename)
+
+        # Write file content securely to disk
+        try:
+            file_content = await file.read()
+            with open(full_file_path, "wb") as f:
+                f.write(file_content)
+        except Exception as e:
+            logging.error(e, exc_info=True)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Disk write error")
+
+        # Log metadata in the database with rollback on failure
         upload_timestamp = datetime.utcnow()
+        try:
+            metadata_record = UploadMetadata(
+                file_path=full_file_path,
+                original_filename=filename,
+                file_size=file_size,
+                upload_timestamp=upload_timestamp
+            )
+            db.add(metadata_record)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logging.error(e, exc_info=True)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database insertion error")
+
+        # Construct payload for n8n workflow integration
         payload = N8nTriggerRequest(
             file_name=filename,
             file_size=file_size,
