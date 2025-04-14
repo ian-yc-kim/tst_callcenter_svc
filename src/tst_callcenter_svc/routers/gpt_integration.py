@@ -28,9 +28,62 @@ class TLSAdapter(requests.adapters.HTTPAdapter):
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         else:
             ctx.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-        self.poolmanager = requests.packages.urllib3.poolmanager.PoolManager(
-            num_pools=connections, maxsize=maxsize, block=block, ssl_context=ctx, **pool_kwargs
-        )
+        # Using requests.packages.urllib3 if available
+        try:
+            from requests.packages.urllib3.poolmanager import PoolManager
+            self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, ssl_context=ctx, **pool_kwargs)
+        except Exception:
+            # Fallback if import fails
+            self.poolmanager = requests.adapters.HTTPAdapter().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
+
+def log_to_airtable(conversation_id: str, analysis: str, log_timestamp: str) -> None:
+    """Helper function to log GPT analysis results to Airtable.
+
+    This function retrieves the necessary Airtable configuration from environment variables,
+    constructs the payload as per Airtable's API requirements, and performs a POST request with
+    retry logic using exponential backoff. Any exceptions are logged without propagating.
+    """
+    try:
+        airtable_api_url = os.getenv("AIRTABLE_API_URL")
+        airtable_api_key = os.getenv("AIRTABLE_API_KEY")
+        airtable_base_id = os.getenv("AIRTABLE_BASE_ID")
+        airtable_table_name = os.getenv("AIRTABLE_TABLE_NAME")
+
+        if not airtable_api_url or not airtable_api_url.startswith("https://"):
+            logging.error("Airtable API URL not set or insecure. Must use https://")
+            return
+
+        payload = {
+            "fields": {
+                "Conversation ID": conversation_id,
+                "Analysis Result": analysis,
+                "Log Timestamp": log_timestamp
+            }
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if airtable_api_key:
+            headers["Authorization"] = f"Bearer {airtable_api_key}"
+
+        session = requests.Session()
+        session.mount("https://", TLSAdapter())
+
+        delay = 1
+        for attempt in range(3):
+            try:
+                response = session.post(airtable_api_url, json=payload, headers=headers, timeout=10, verify=True)
+                if response.status_code == 200:
+                    break
+                else:
+                    logging.error(f"Airtable logging attempt {attempt + 1} failed with status {response.status_code}")
+            except Exception as e:
+                logging.error(e, exc_info=True)
+            if attempt < 2:
+                time.sleep(delay)
+                delay *= 2
+    except Exception as e:
+        logging.error(e, exc_info=True)
 
 
 @router.post("/analyze")
@@ -59,7 +112,6 @@ def analyze_conversation(request: GPTAnalyzeRequest):
             logging.error(msg)
             raise HTTPException(status_code=500, detail=msg)
 
-        # Setup headers with authorization and HIPAA compliant headers
         headers = {
             "Authorization": f"Bearer {gpt_api_key}",
             "X-Content-Type-Options": "nosniff",
@@ -84,6 +136,11 @@ def analyze_conversation(request: GPTAnalyzeRequest):
                 if response.status_code == 200:
                     data = response.json()
                     analysis = data.get('analysis')
+                    # Attempt to log the analysis result to Airtable without affecting response
+                    try:
+                        log_to_airtable(request.conversation_id, analysis, request.timestamp.isoformat())
+                    except Exception as log_err:
+                        logging.error(log_err, exc_info=True)
                     return {"success": True, "analysis": analysis}
                 else:
                     logging.error(f"Attempt {attempt+1}: Received status code {response.status_code} from GPT API")
